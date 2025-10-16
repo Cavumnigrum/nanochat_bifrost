@@ -320,3 +320,166 @@ class GPT(nn.Module):
             ids = torch.cat((ids, next_ids), dim=1)
             token = next_ids.item()
             yield token
+
+# -----------------------------------------------------------------------------
+# Bifrost Extension: Bidirectional Self-Consistency Training
+# -----------------------------------------------------------------------------
+
+@dataclass
+class GPTBifrostConfig(GPTConfig):
+    """GPT config with Bifrost parameters"""
+    bifrost_enabled: bool = False
+    bifrost_alpha: float = 0.2 # вес consistency loss
+    bifrost_lambda: float = 0.2 # дополнительный множитель
+    bifrost_beta: float = 0.6 # баланс fwd/bwd (0.5 = равный вес)
+
+
+class GPTBifrost(GPT):
+    """
+    GPT with bidirectional self-consistency training (Bifrost).
+    
+    Main idea:
+    1. Forward pass (normal autoregressive)
+    2. Backward pass (reversed sequence through same weights)
+    3. Consistency loss (JS divergence between forward and backward)
+    4. Total loss = beta*L_fwd + (1-beta)*L_bwd + alpha*lambda*L_consistency
+    """
+    
+    def __init__(self, config):
+        # Bifrost требует GPTBifrostConfig, но для совместимости принимаем и GPTConfig
+        if not isinstance(config, GPTBifrostConfig):
+            # Upgrade regular config to Bifrost config with defaults
+            bifrost_config = GPTBifrostConfig(**config.__dict__)
+            bifrost_config.bifrost_enabled = True # Default to enabled if using GPTBifrost
+            config = bifrost_config
+        super().__init__(config)
+        self.last_metrics = {} # Для логирования метрик
+    
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+        """
+        Forward pass with optional Bifrost training.
+        
+        Args:
+            idx: (B, T) input token ids
+            targets: (B, T) target token ids for training
+            kv_cache: KV cache for inference (not used with Bifrost)
+            loss_reduction: 'mean' or 'none'
+        
+        Returns:
+            - If targets is None: logits (B, T, vocab_size) for inference
+            - If targets is not None: scalar loss for training
+            
+        Side effect: sets self.last_metrics dict for logging
+        """
+        B, T = idx.size()
+        device = idx.device
+        
+        # === ПРЯМОЙ ПРОХОД (обычный autoregressive) ===
+        assert T <= self.cos.size(1), f"Sequence too long: {T} > {self.cos.size(1)}"
+        T0 = 0 if kv_cache is None else kv_cache.get_pos()
+        cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T]
+        
+        # Token + position embeddings
+        x_fwd = self.transformer.wte(idx)
+        x_fwd = norm(x_fwd)
+        
+        # Transformer blocks
+        for block in self.transformer.h:
+            x_fwd = block(x_fwd, cos_sin, kv_cache)
+        x_fwd = norm(x_fwd)
+        
+        # Logits
+        logits_fwd = self.lm_head(x_fwd)
+        softcap = 15
+        logits_fwd = softcap * torch.tanh(logits_fwd / softcap)
+        
+        # === INFERENCE MODE ===
+        if targets is None:
+            return logits_fwd
+        
+        # === TRAINING MODE ===
+        logits_fwd = logits_fwd.float() # tf32/fp32 for loss calculation
+        
+        # Если Bifrost отключен, возвращаем обычный loss
+        if not self.config.bifrost_enabled:
+            loss = F.cross_entropy(
+                logits_fwd.view(-1, logits_fwd.size(-1)),
+                targets.view(-1),
+                ignore_index=-1,
+                reduction=loss_reduction
+            )
+            return loss
+        
+        # === BIFROST MODE: добавляем обратный проход ===
+        
+        # Важно: обратный проход НЕ использует KV cache (это только для обучения)
+        assert kv_cache is None, "Bifrost training incompatible with KV cache"
+        
+        # Получаем эмбеддинги (повторно, но с detach для обратного прохода)
+        with torch.no_grad():
+            x_bwd_input = self.transformer.wte(idx)
+            x_bwd_input = norm(x_bwd_input)
+        
+        # Переворачиваем sequence dimension
+        x_bwd = torch.flip(x_bwd_input, dims=[1])
+        
+        # Обратный проход через те же блоки (веса общие!)
+        for block in self.transformer.h:
+            x_bwd = block(x_bwd, cos_sin, kv_cache=None)
+        x_bwd = norm(x_bwd)
+        
+        # Logits для обратного прохода
+        logits_bwd_flipped = self.lm_head(x_bwd)
+        logits_bwd_flipped = softcap * torch.tanh(logits_bwd_flipped / softcap)
+        logits_bwd_flipped = logits_bwd_flipped.float()
+        
+        # Переворачиваем обратно для alignment с targets
+        logits_bwd = torch.flip(logits_bwd_flipped, dims=[1])
+        
+        # === КОМПОНЕНТЫ LOSS ===
+        
+        # 1. Accuracy Loss (взвешенная комбинация forward и backward)
+        shift_logits_fwd = logits_fwd[:, :-1, :].contiguous()
+        shift_logits_bwd = logits_bwd[:, :-1, :].contiguous()
+        shift_targets = targets[:, 1:].contiguous()
+        
+        loss_fwd = F.cross_entropy(
+            shift_logits_fwd.view(-1, self.config.vocab_size),
+            shift_targets.view(-1),
+            ignore_index=-1,
+            reduction=loss_reduction
+        )
+        loss_bwd = F.cross_entropy(
+            shift_logits_bwd.view(-1, self.config.vocab_size),
+            shift_targets.view(-1),
+            ignore_index=-1,
+            reduction=loss_reduction
+        )
+        
+        beta = self.config.bifrost_beta
+        loss_acc = beta * loss_fwd + (1 - beta) * loss_bwd
+        
+        # 2. Consistency Loss (JS divergence между forward и backward)
+        # JS(P||Q) = 0.5 * KL(P||M) + 0.5 * KL(Q||M), где M = (P+Q)/2
+        p_fwd = F.softmax(shift_logits_fwd, dim=-1).clamp(min=1e-10)
+        p_bwd = F.softmax(shift_logits_bwd, dim=-1).clamp(min=1e-10)
+        m = (p_fwd + p_bwd) / 2.0
+        
+        kl_fwd = F.kl_div(m.log(), p_fwd, reduction='batchmean')
+        kl_bwd = F.kl_div(m.log(), p_bwd, reduction='batchmean')
+        loss_cons = (kl_fwd + kl_bwd) / 2.0
+        
+        # === ФИНАЛЬНЫЙ LOSS ===
+        alpha = self.config.bifrost_alpha
+        lmd = self.config.bifrost_lambda
+        total_loss = loss_acc + alpha * lmd * loss_cons
+        
+        # Сохраняем метрики для логирования (detach чтобы не держать граф)
+        self.last_metrics = {
+            'loss_acc': loss_acc.detach(),
+            'loss_cons': loss_cons.detach(),
+            'loss_fwd': loss_fwd.detach(),
+            'loss_bwd': loss_bwd.detach(),
+        }
+        
+        return total_loss
