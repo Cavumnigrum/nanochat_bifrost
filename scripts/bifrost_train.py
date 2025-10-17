@@ -22,21 +22,22 @@ from nanochat.dataloader import tokenizing_distributed_data_loader
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint
-from nanochat.loss_eval import evaluate_bpb
+from nanochat.loss_eval import evaluate_bpb, evaluate_bpb_bifrost
 from nanochat.engine import Engine
 from scripts.base_eval import evaluate_model
 print_banner()
+
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 
 # -----------------------------------------------------------------------------
 # User settings (такие же как в base_train.py + параметры Bifrost)
 run = "dummy"
 depth = 12
-max_seq_len = 2048
+max_seq_len = 1024
 num_iterations = -1
 target_flops = -1.0
 target_param_data_ratio = 20
-device_batch_size = 32
-total_batch_size = 524288
 embedding_lr = 0.2
 unembedding_lr = 0.004
 weight_decay = 0.0
@@ -48,6 +49,9 @@ bifrost_enabled = True # Главный переключатель
 bifrost_alpha = 0.2 # Вес consistency loss
 bifrost_lambda = 0.2 # Дополнительный множитель
 bifrost_beta = 0.6 # Баланс fwd/bwd (0.5 = равный вес)
+
+device_batch_size = 4
+total_batch_size = 524288
 
 eval_every = 250
 eval_tokens = 20*524288
@@ -64,7 +68,7 @@ user_config = {k: globals()[k] for k in config_keys}
 # Compute init
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init()
 master_process = ddp_rank == 0
-autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.float16)
 
 # wandb logging
 use_dummy_wandb = run == "dummy" or not master_process
@@ -112,7 +116,7 @@ model_config_kwargs = dict(
 tokens_per_fwdbwd = device_batch_size * max_seq_len
 world_tokens_per_fwdbwd = tokens_per_fwdbwd * ddp_world_size
 assert total_batch_size % world_tokens_per_fwdbwd == 0
-grad_accum_steps = total_batch_size // world_tokens_per_fwdbwd
+grad_accum_steps = total_batch_size // (device_batch_size * max_seq_len * ddp_world_size)
 print0(f"Tokens / micro-batch / rank: {device_batch_size} x {max_seq_len} = {tokens_per_fwdbwd:,}")
 print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
@@ -189,6 +193,7 @@ min_val_bpb = float("inf")
 smooth_train_loss = 0
 ema_beta = 0.9
 total_training_time = 0
+# scaler = torch.cuda.amp.GradScaler()
 
 for step in range(num_iterations + 1):
     last_step = step == num_iterations
@@ -200,7 +205,7 @@ for step in range(num_iterations + 1):
         val_loader = build_val_loader()
         eval_steps = eval_tokens // (device_batch_size * max_seq_len * ddp_world_size)
         with autocast_ctx:
-            val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
+            val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes) if bifrost_enabled==False else evaluate_bpb_bifrost(model, val_loader, eval_steps, token_bytes)
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.4f}")
         min_val_bpb = min(min_val_bpb, val_bpb)
         wandb_run.log({
@@ -277,10 +282,13 @@ for step in range(num_iterations + 1):
         
         train_loss = loss.detach()
         loss = loss / grad_accum_steps
+        # scaler.scale(loss).backward()
         loss.backward()
         x, y = next(train_loader)
     
     # Gradient clipping
+    # scaler.unscale_(adamw_optimizer)
+    # scaler.unscale_(muon_optimizer)
     if grad_clip > 0.0:
         torch.nn.utils.clip_grad_norm_(orig_model.parameters(), grad_clip)
     
@@ -296,6 +304,8 @@ for step in range(num_iterations + 1):
     
     for opt in optimizers:
         opt.step()
+        # scaler.step(opt)
+    # scaler.update()
     model.zero_grad(set_to_none=True)
     
     torch.cuda.synchronize()

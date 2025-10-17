@@ -61,3 +61,20 @@ def evaluate_bpb(model, batches, steps, token_bytes):
     total_bytes = total_bytes.item()
     bpb = total_nats / (math.log(2) * total_bytes)
     return bpb
+    
+@torch.no_grad()
+def evaluate_bpb_bifrost(model, loader, steps, token_bytes):
+    """Wrapper для evaluate_bpb который временно отключает bifrost метрики"""
+    original_enabled = model.bifrost_enabled if hasattr(model, 'bifrost_enabled') else False
+    
+    # Временно отключаем bifrost для eval (быстрее и совместимо)
+    if hasattr(model, 'bifrost_enabled'):
+        model.bifrost_enabled = False
+    
+    bpb = evaluate_bpb(model, loader, steps, token_bytes)
+    
+    # Восстанавливаем
+    if hasattr(model, 'bifrost_enabled'):
+        model.bifrost_enabled = original_enabled
+    
+    return bpb

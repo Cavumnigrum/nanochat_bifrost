@@ -334,6 +334,8 @@ class GPTBifrostConfig(GPTConfig):
     bifrost_beta: float = 0.6 # баланс fwd/bwd (0.5 = равный вес)
 
 
+import torch.utils.checkpoint as checkpoint
+
 class GPTBifrost(GPT):
     """
     GPT with bidirectional self-consistency training (Bifrost).
@@ -344,33 +346,17 @@ class GPTBifrost(GPT):
     3. Consistency loss (JS divergence between forward and backward)
     4. Total loss = beta*L_fwd + (1-beta)*L_bwd + alpha*lambda*L_consistency
     """
-    
     def __init__(self, config):
-        # Bifrost требует GPTBifrostConfig, но для совместимости принимаем и GPTConfig
         if not isinstance(config, GPTBifrostConfig):
-            # Upgrade regular config to Bifrost config with defaults
             bifrost_config = GPTBifrostConfig(**config.__dict__)
-            bifrost_config.bifrost_enabled = True # Default to enabled if using GPTBifrost
+            bifrost_config.bifrost_enabled = True
             config = bifrost_config
         super().__init__(config)
-        self.last_metrics = {} # Для логирования метрик
+        self.last_metrics = {}
+        # Добавляем флаг для gradient checkpointing
+        self.use_gradient_checkpointing = getattr(config, 'use_gradient_checkpointing', True)
     
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
-        """
-        Forward pass with optional Bifrost training.
-        
-        Args:
-            idx: (B, T) input token ids
-            targets: (B, T) target token ids for training
-            kv_cache: KV cache for inference (not used with Bifrost)
-            loss_reduction: 'mean' or 'none'
-        
-        Returns:
-            - If targets is None: logits (B, T, vocab_size) for inference
-            - If targets is not None: scalar loss for training
-            
-        Side effect: sets self.last_metrics dict for logging
-        """
         B, T = idx.size()
         device = idx.device
         
@@ -379,28 +365,22 @@ class GPTBifrost(GPT):
         T0 = 0 if kv_cache is None else kv_cache.get_pos()
         cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T]
         
-        # Token + position embeddings
         x_fwd = self.transformer.wte(idx)
         x_fwd = norm(x_fwd)
         
-        # Transformer blocks
         for block in self.transformer.h:
             x_fwd = block(x_fwd, cos_sin, kv_cache)
         x_fwd = norm(x_fwd)
         
-        # Logits
         logits_fwd = self.lm_head(x_fwd)
         softcap = 15
         logits_fwd = softcap * torch.tanh(logits_fwd / softcap)
         
-        # === INFERENCE MODE ===
         if targets is None:
             return logits_fwd
         
-        # === TRAINING MODE ===
-        logits_fwd = logits_fwd.float() # tf32/fp32 for loss calculation
+        logits_fwd = logits_fwd.float()
         
-        # Если Bifrost отключен, возвращаем обычный loss
         if not self.config.bifrost_enabled:
             loss = F.cross_entropy(
                 logits_fwd.view(-1, logits_fwd.size(-1)),
@@ -410,76 +390,87 @@ class GPTBifrost(GPT):
             )
             return loss
         
-        # === BIFROST MODE: добавляем обратный проход ===
-        
-        # Важно: обратный проход НЕ использует KV cache (это только для обучения)
+        # === BIFROST MODE с оптимизацией памяти ===
         assert kv_cache is None, "Bifrost training incompatible with KV cache"
         
-        # Получаем эмбеддинги (повторно, но с detach для обратного прохода)
-        with torch.no_grad():
-            x_bwd_input = self.transformer.wte(idx)
-            x_bwd_input = norm(x_bwd_input)
+        # КРИТИЧНО: используем detach() чтобы не держать граф прямого прохода
+        logits_fwd_detached = logits_fwd.detach().requires_grad_(True)
         
-        # Переворачиваем sequence dimension
+        # Обратный проход с gradient checkpointing
+        x_bwd_input = self.transformer.wte(idx)
+        x_bwd_input = norm(x_bwd_input)
         x_bwd = torch.flip(x_bwd_input, dims=[1])
         
-        # Обратный проход через те же блоки (веса общие!)
-        for block in self.transformer.h:
-            x_bwd = block(x_bwd, cos_sin, kv_cache=None)
-        x_bwd = norm(x_bwd)
+        # Используем gradient checkpointing для экономии памяти
+        if self.use_gradient_checkpointing and self.training:
+            # Прогоняем через блоки с checkpointing
+            for block in self.transformer.h:
+                # checkpoint сохраняет только входы, пересчитывает на backward
+                x_bwd = checkpoint.checkpoint(
+                    block,
+                    x_bwd,
+                    cos_sin,
+                    None,  # kv_cache=None
+                    use_reentrant=False  # рекомендуется для новых версий PyTorch
+                )
+        else:
+            # Без checkpointing (для eval или если отключено)
+            for block in self.transformer.h:
+                x_bwd = block(x_bwd, cos_sin, kv_cache=None)
         
-        # Logits для обратного прохода
+        x_bwd = norm(x_bwd)
         logits_bwd_flipped = self.lm_head(x_bwd)
         logits_bwd_flipped = softcap * torch.tanh(logits_bwd_flipped / softcap)
         logits_bwd_flipped = logits_bwd_flipped.float()
-        
-        # Переворачиваем обратно для alignment с targets
         logits_bwd = torch.flip(logits_bwd_flipped, dims=[1])
         
-        # === КОМПОНЕНТЫ LOSS ===
-        
-        # 1. Accuracy Loss (взвешенная комбинация forward и backward)
-        shift_logits_fwd = logits_fwd[:, :-1, :].contiguous()
-        shift_logits_bwd = logits_bwd[:, :-1, :].contiguous()
-        shift_targets = targets[:, 1:].contiguous()
-        
+        # === LOSS CALCULATION ===
         loss_fwd = F.cross_entropy(
-            shift_logits_fwd.view(-1, self.config.vocab_size),
-            shift_targets.view(-1),
+            logits_fwd.view(-1, self.config.vocab_size),
+            targets.view(-1),
             ignore_index=-1,
-            reduction=loss_reduction
+            reduction='none' if loss_reduction == 'none' else 'mean'
         )
         loss_bwd = F.cross_entropy(
-            shift_logits_bwd.view(-1, self.config.vocab_size),
-            shift_targets.view(-1),
+            logits_bwd.view(-1, self.config.vocab_size),
+            targets.view(-1),
             ignore_index=-1,
-            reduction=loss_reduction
+            reduction='none' if loss_reduction == 'none' else 'mean'
         )
+        
+        if loss_reduction == 'none':
+            loss_fwd = loss_fwd.view(B, T)
+            loss_bwd = loss_bwd.view(B, T)
         
         beta = self.config.bifrost_beta
         loss_acc = beta * loss_fwd + (1 - beta) * loss_bwd
         
-        # 2. Consistency Loss (JS divergence между forward и backward)
-        # JS(P||Q) = 0.5 * KL(P||M) + 0.5 * KL(Q||M), где M = (P+Q)/2
-        p_fwd = F.softmax(shift_logits_fwd, dim=-1).clamp(min=1e-10)
-        p_bwd = F.softmax(shift_logits_bwd, dim=-1).clamp(min=1e-10)
-        m = (p_fwd + p_bwd) / 2.0
+        # Consistency loss с detach для экономии памяти
+        with torch.no_grad():
+            shift_logits_fwd = logits_fwd[:, :-1, :].contiguous()
+            shift_logits_bwd = logits_bwd[:, :-1, :].contiguous()
+            
+            p_fwd = F.softmax(shift_logits_fwd, dim=-1).clamp(min=1e-10)
+            p_bwd = F.softmax(shift_logits_bwd, dim=-1).clamp(min=1e-10)
+            m = (p_fwd + p_bwd) / 2.0
+            
+            kl_fwd = F.kl_div(m.log(), p_fwd, reduction='batchmean')
+            kl_bwd = F.kl_div(m.log(), p_bwd, reduction='batchmean')
+            loss_cons = (kl_fwd + kl_bwd) / 2.0
         
-        kl_fwd = F.kl_div(m.log(), p_fwd, reduction='batchmean')
-        kl_bwd = F.kl_div(m.log(), p_bwd, reduction='batchmean')
-        loss_cons = (kl_fwd + kl_bwd) / 2.0
-        
-        # === ФИНАЛЬНЫЙ LOSS ===
         alpha = self.config.bifrost_alpha
         lmd = self.config.bifrost_lambda
-        total_loss = loss_acc + alpha * lmd * loss_cons
         
-        # Сохраняем метрики для логирования (detach чтобы не держать граф)
+        if loss_reduction == 'none':
+            total_loss = loss_acc + (alpha * lmd * loss_cons) / (B * T)
+        else:
+            total_loss = loss_acc + alpha * lmd * loss_cons
+        
         self.last_metrics = {
-            'loss_acc': loss_acc.detach(),
+            'loss_acc': loss_acc.mean().detach() if loss_reduction == 'none' else loss_acc.detach(),
             'loss_cons': loss_cons.detach(),
-            'loss_fwd': loss_fwd.detach(),
-            'loss_bwd': loss_bwd.detach(),
+            'loss_fwd': loss_fwd.mean().detach() if loss_reduction == 'none' else loss_fwd.detach(),
+            'loss_bwd': loss_bwd.mean().detach() if loss_reduction == 'none' else loss_bwd.detach(),
         }
         
         return total_loss
