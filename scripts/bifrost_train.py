@@ -34,15 +34,15 @@ torch.backends.cudnn.allow_tf32 = True
 # User settings (такие же как в base_train.py + параметры Bifrost)
 run = "dummy"
 depth = 12
-max_seq_len = 1024
+max_seq_len = int(1024 * 1.5)
 num_iterations = -1
 target_flops = -1.0
 target_param_data_ratio = 20
-embedding_lr = 0.2
-unembedding_lr = 0.004
+embedding_lr = 0.02
+unembedding_lr = 0.001
 weight_decay = 0.0
-matrix_lr = 0.02
-grad_clip = 1.0
+matrix_lr = 0.006
+grad_clip = 0.75
 
 # === BIFROST ПАРАМЕТРЫ ===
 bifrost_enabled = True # Главный переключатель
@@ -51,13 +51,13 @@ bifrost_lambda = 0.2 # Дополнительный множитель
 bifrost_beta = 0.6 # Баланс fwd/bwd (0.5 = равный вес)
 
 device_batch_size = 4
-total_batch_size = 524288
+total_batch_size = int(1.5*524288/2)
 
 eval_every = 250
-eval_tokens = 20*524288
+eval_tokens = 20*int(1.5*524288/2)
 core_metric_every = 2000
 core_metric_max_per_task = 500
-sample_every = 2000
+sample_every = 500
 model_tag = "" # Если пусто, будет "d<depth>_bifrost" или "d<depth>_baseline"
 
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
@@ -68,7 +68,8 @@ user_config = {k: globals()[k] for k in config_keys}
 # Compute init
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init()
 master_process = ddp_rank == 0
-autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.float16)
+autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.float32)
+
 
 # wandb logging
 use_dummy_wandb = run == "dummy" or not master_process
@@ -116,7 +117,7 @@ model_config_kwargs = dict(
 tokens_per_fwdbwd = device_batch_size * max_seq_len
 world_tokens_per_fwdbwd = tokens_per_fwdbwd * ddp_world_size
 assert total_batch_size % world_tokens_per_fwdbwd == 0
-grad_accum_steps = total_batch_size // (device_batch_size * max_seq_len * ddp_world_size)
+grad_accum_steps = 2 * total_batch_size // (device_batch_size * max_seq_len * ddp_world_size)
 print0(f"Tokens / micro-batch / rank: {device_batch_size} x {max_seq_len} = {tokens_per_fwdbwd:,}")
 print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
@@ -168,7 +169,7 @@ build_val_loader = lambda: tokenizing_distributed_data_loader(device_batch_size,
 x, y = next(train_loader)
 
 # LR scheduler
-warmup_ratio = 0.0
+warmup_ratio = 0.05
 warmdown_ratio = 0.2
 final_lr_frac = 0.0
 
@@ -290,8 +291,9 @@ for step in range(num_iterations + 1):
     # scaler.unscale_(adamw_optimizer)
     # scaler.unscale_(muon_optimizer)
     if grad_clip > 0.0:
-        torch.nn.utils.clip_grad_norm_(orig_model.parameters(), grad_clip)
-    
+        grad_norm = torch.nn.utils.clip_grad_norm_(orig_model.parameters(), grad_clip)
+        if step % 10 == 0:
+            print0(f"  grad_norm: {grad_norm:.4f}")
     # Optimizer step
     lrm = get_lr_multiplier(step)
     for opt in optimizers:

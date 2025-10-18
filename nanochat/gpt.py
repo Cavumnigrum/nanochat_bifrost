@@ -171,6 +171,7 @@ class GPT(nn.Module):
         self.register_buffer("sin", sin, persistent=False)
         # Cast the embeddings from fp32 to bf16: optim can tolerate it and it saves memory: both in the model and the activations
         self.transformer.wte.to(dtype=torch.bfloat16)
+        
 
     def init_weights(self):
         self.apply(self._init_weights)
