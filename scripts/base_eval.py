@@ -39,6 +39,7 @@ def evaluate_model(model, tokenizer, device, max_per_task=-1):
     config_path = os.path.join(eval_bundle_dir, "core.yaml")
     data_base_path = os.path.join(eval_bundle_dir, "eval_data")
     eval_meta_data = os.path.join(eval_bundle_dir, "eval_meta_data.csv")
+    print(base_dir, eval_bundle_dir, config_path, data_base_path, eval_meta_data)
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
     tasks = config['icl_tasks']
@@ -122,8 +123,8 @@ def main():
 
     # distributed / precision setup
     ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init()
-    autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
-
+    autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.float32)
+    # print(sys.argv[1])
     # Load model and tokenizer from command line or from file system
     if len(sys.argv) >= 2:
         # atm assume that if a path is given, it's a huggingface model path

@@ -9,7 +9,7 @@ import logging
 import torch
 
 from nanochat.common import get_base_dir
-from nanochat.gpt import GPT, GPTConfig
+from nanochat.gpt import GPT, GPTConfig, GPTBifrostConfig, GPTBifrost
 from nanochat.tokenizer import get_tokenizer
 from nanochat.common import setup_default_logging
 
@@ -69,9 +69,14 @@ def build_model(checkpoint_dir, step, device, phase):
     model_data = {k.lstrip("_orig_mod."): v for k, v in model_data.items()}
     model_config_kwargs = meta_data["model_config"]
     log0(f"Building model with config: {model_config_kwargs}")
-    model_config = GPTConfig(**model_config_kwargs)
-    with torch.device("meta"):
-        model = GPT(model_config)
+    try:
+        model_config = GPTConfig(**model_config_kwargs)
+        with torch.device("meta"):
+            model = GPT(model_config)
+    except TypeError:
+        model_config = GPTBifrostConfig(**model_config_kwargs)
+        with torch.device("meta"):
+            model = GPTBifrost(model_config)
     # Load the model state
     model.to_empty(device=device)
     model.init_weights() # note: this is dumb, but we need to init the rotary embeddings. TODO: fix model re-init
@@ -137,10 +142,12 @@ def load_model_from_dir(checkpoints_dir, device, phase, model_tag=None, step=Non
 def load_model(source, *args, **kwargs):
     model_dir = {
         "base": "base_checkpoints",
+        "bifrost": "bifrost_checkpoints",
         "mid": "mid_checkpoints",
         "sft": "chatsft_checkpoints",
         "rl": "chatrl_checkpoints",
     }[source]
     base_dir = get_base_dir()
+    print(base_dir)
     checkpoints_dir = os.path.join(base_dir, model_dir)
     return load_model_from_dir(checkpoints_dir, *args, **kwargs)
